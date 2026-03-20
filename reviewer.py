@@ -95,14 +95,12 @@ def add_comment(doc, paragraph, run, comment_text, author="Document Reviewer"):
 def _get_or_create_comments_part(doc):
     """Gets or creates the comments part and ensures ._comments_root is set.
 
-    python-docx's plain Part stores the XML as opaque bytes (blob).  The only
-    way to make element-level mutations survive doc.save() is to serialise the
-    modified element back into the blob.  We therefore:
-      1. parse the blob with lxml into ._comments_root immediately,
-      2. let add_comment() mutate that element, and
-      3. call _sync_comments_part() before saving to write the element back.
+    Key insight: CommentsPart is an XmlPart subclass. XmlPart keeps a single
+    cached lxml element in ._element and its blob property serialises from it
+    automatically on save — no manual sync needed. We must therefore point
+    ._comments_root at the SAME object as ._element, not a freshly parsed copy.
     """
-    from docx.opc.part import Part
+    from docx.opc.part import XmlPart
     from docx.opc.packuri import PackURI
     from docx.oxml import parse_xml
 
@@ -111,55 +109,34 @@ def _get_or_create_comments_part(doc):
 
     part = doc.part
 
-    # Return existing part if already set up
+    # Return existing part (CommentsPart extends XmlPart: ._element is the root)
     try:
         for rel in part.rels.values():
             if rel.reltype == REL_TYPE:
                 cp = rel.target_part
                 if not hasattr(cp, "_comments_root"):
-                    cp._comments_root = parse_xml(cp.blob)
+                    # Point to the real cached element so mutations are saved
+                    if hasattr(cp, "_element"):
+                        cp._comments_root = cp._element
+                    else:
+                        cp._comments_root = parse_xml(cp.blob)
                 return cp
     except Exception:
         pass
 
-    # Build a minimal comments.xml and parse it
+    # Create a new XmlPart: constructor takes (partname, ct, element, package)
     comments_xml = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
         '</w:comments>'
     )
-    xml_bytes = comments_xml.encode("utf-8")
-    cp = Part(PackURI("/word/comments.xml"), CT_COMMENTS, xml_bytes, part.package)
-    cp._comments_root = parse_xml(xml_bytes)
+    element = parse_xml(comments_xml.encode("utf-8"))
+    cp = XmlPart(PackURI("/word/comments.xml"), CT_COMMENTS, element, part.package)
+    # XmlPart stores the element as ._element; point our alias at the same object
+    cp._comments_root = cp._element
     part.relate_to(cp, REL_TYPE)
     return cp
-
-
-def _sync_comments_part(doc):
-    """Serialise the mutated comments element back into the part's blob.
-
-    Must be called once, right before doc.save(), so that all comment XML
-    written via add_comment() actually ends up in the output file.
-    """
-    from docx.oxml.ns import nsmap
-    from lxml import etree
-
-    REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
-    try:
-        for rel in doc.part.rels.values():
-            if rel.reltype == REL_TYPE:
-                cp = rel.target_part
-                if hasattr(cp, "_comments_root"):
-                    cp.blob = etree.tostring(
-                        cp._comments_root,
-                        xml_declaration=True,
-                        encoding="UTF-8",
-                        standalone=True,
-                    )
-                return
-    except Exception as e:
-        logger.warning("Kommentar-Synchronisierung fehlgeschlagen: %s", e)
 
 
 def call_claude(text, role):
@@ -479,6 +456,11 @@ def add_findings_appendix(out_doc, findings):
         tcPr.append(shd)
 
 
+def _norm(s):
+    """Normalise whitespace and lower-case for fuzzy matching."""
+    return re.sub(r"\s+", " ", s.strip()).lower()
+
+
 def _collect_all_paragraphs(doc):
     """Return (text, paragraph) tuples for ALL paragraphs in the document,
     including those inside table cells.  Plain doc.paragraphs skips tables."""
@@ -500,6 +482,50 @@ def _collect_all_paragraphs(doc):
                 if txt.strip():
                     result.append((txt, p_obj))
     return result
+
+
+def _find_table_paragraph_for_quote(doc, quote):
+    """Search for a quote across the joined text of each table row.
+
+    Claude often cites text that spans multiple cells or comes from a table
+    formatted as 'cell1 | cell2'.  This function joins all cell texts of each
+    row and returns the first paragraph of the first row whose combined text
+    contains (a prefix of) the quote.
+    """
+    from docx.oxml.ns import qn as _qn
+    from docx.text.paragraph import Paragraph
+
+    norm_quote = _norm(quote)
+    # Use progressively shorter prefixes so we get *some* match
+    min_len = max(15, len(norm_quote) // 3)
+    prefixes = []
+    for frac in (1.0, 0.6, 0.4):
+        chunk = norm_quote[: max(min_len, int(len(norm_quote) * frac))]
+        if chunk not in prefixes:
+            prefixes.append(chunk)
+
+    for table in doc.tables:
+        for row in table.rows:
+            seen = set()
+            first_para = None
+            texts = []
+            for cell in row.cells:
+                if id(cell) in seen:
+                    continue
+                seen.add(id(cell))
+                for para in cell.paragraphs:
+                    t = para.text.strip()
+                    if t:
+                        texts.append(t)
+                        if first_para is None:
+                            first_para = para
+            if first_para is None:
+                continue
+            row_norm = _norm(" ".join(texts))
+            for prefix in prefixes:
+                if prefix in row_norm:
+                    return first_para
+    return None
 
 
 def process_document(text, role, output_dir, source_doc=None):
@@ -558,6 +584,30 @@ def process_document(text, role, output_dir, source_doc=None):
                 matched = True
                 break
 
+        if not matched and source_doc is not None:
+            # Fallback: search across joined table-row text.  Claude often
+            # cites text that spans multiple cells; individual cell paragraphs
+            # won't match the full quote.
+            tbl_para = _find_table_paragraph_for_quote(out_doc, quote)
+            if tbl_para is not None:
+                severity = finding.get("severity", "green")
+                color = SEVERITY_COLORS.get(severity, "C6EFCE")
+                comment_text = (
+                    f"[{SEVERITY_LABELS.get(severity, '')}] {finding.get('comment', '')}"
+                )
+                if tbl_para.runs:
+                    target_run = tbl_para.runs[0]
+                else:
+                    target_run = tbl_para.add_run("")
+                highlight_run(target_run, color)
+                try:
+                    add_comment(out_doc, tbl_para, target_run, comment_text)
+                except Exception as e:
+                    logger.warning("Kommentar in Tabellenzelle fehlgeschlagen: %s", e)
+                matched = True
+                logger.info("Finding #%s per Tabellenzeilen-Fallback platziert",
+                            finding.get("id", "?"))
+
         if not matched:
             logger.warning("Quote nicht im Dokument gefunden (Finding #%s): '%s...'",
                            finding.get("id", "?"), quote[:60])
@@ -591,9 +641,6 @@ def process_document(text, role, output_dir, source_doc=None):
 
     if unmatched_findings:
         logger.warning("%d Findings konnten nicht zugeordnet werden", len(unmatched_findings))
-
-    # Serialise mutated comments element back into the part blob before saving
-    _sync_comments_part(out_doc)
 
     # Save output
     output_path = os.path.join(output_dir, f"review_{uuid.uuid4()}.docx")
