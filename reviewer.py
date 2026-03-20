@@ -350,15 +350,35 @@ def apply_finding_to_paragraph(doc, out_para, finding, quote):
 
 
 def copy_paragraph(out_doc, src_para):
-    """Deep-copies a paragraph including all formatting/runs into out_doc."""
+    """
+    Copies a paragraph with formatting into out_doc, safely.
+    Skips relationship-based elements (hyperlinks, drawings, objects) that would
+    produce invalid r:id references in the new document and corrupt it.
+    """
     import copy as _copy
-    from docx.text.paragraph import Paragraph as DocxParagraph
 
-    src_copy = _copy.deepcopy(src_para._p)
-    # Add empty placeholder paragraph, then replace its element
-    placeholder = out_doc.add_paragraph()
-    placeholder._p.getparent().replace(placeholder._p, src_copy)
-    return DocxParagraph(src_copy, src_copy.getparent())
+    out_para = out_doc.add_paragraph()
+    # Clear the default empty paragraph element that add_paragraph creates
+    for child in list(out_para._p):
+        out_para._p.remove(child)
+
+    for child in src_para._p:
+        tag = child.tag
+        if tag == qn("w:pPr"):
+            # Paragraph properties: alignment, indentation, spacing, style, numbering.
+            # These contain no r:id relationship references — safe to deep-copy.
+            out_para._p.append(_copy.deepcopy(child))
+        elif tag == qn("w:r"):
+            # Regular run: rPr (bold/italic/font/size/color) has no r:id refs — safe.
+            out_para._p.append(_copy.deepcopy(child))
+        elif tag == qn("w:hyperlink"):
+            # Hyperlink carries an r:id ref we must NOT copy. Extract inner runs only.
+            for inner_run in child.findall(qn("w:r")):
+                out_para._p.append(_copy.deepcopy(inner_run))
+        # Skip: w:drawing, w:object, w:pict (images) and w:bookmarkStart/End,
+        # w:proofErr, w:ins, w:del — all either carry r:id refs or are irrelevant.
+
+    return out_para
 
 
 def add_summary_section(out_doc, summary):
