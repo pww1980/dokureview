@@ -42,9 +42,9 @@ def highlight_run(run, hex_color):
 
 def add_comment(doc, paragraph, run, comment_text, author="Document Reviewer"):
     """Adds a Word comment to a run via direct XML manipulation."""
-    # Get or create comments part
+    # Get or create comments part; element is stored in ._comments_root
     comments_part = _get_or_create_comments_part(doc)
-    comments_element = comments_part.element
+    comments_element = comments_part._comments_root
 
     # Generate a unique comment ID
     existing_ids = [
@@ -93,43 +93,73 @@ def add_comment(doc, paragraph, run, comment_text, author="Document Reviewer"):
 
 
 def _get_or_create_comments_part(doc):
-    """Gets or creates the comments part of the document."""
-    from docx.opc.part import XmlPart
+    """Gets or creates the comments part and ensures ._comments_root is set.
+
+    python-docx's plain Part stores the XML as opaque bytes (blob).  The only
+    way to make element-level mutations survive doc.save() is to serialise the
+    modified element back into the blob.  We therefore:
+      1. parse the blob with lxml into ._comments_root immediately,
+      2. let add_comment() mutate that element, and
+      3. call _sync_comments_part() before saving to write the element back.
+    """
+    from docx.opc.part import Part
     from docx.opc.packuri import PackURI
+    from docx.oxml import parse_xml
 
     CT_COMMENTS = "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"
     REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
 
     part = doc.part
 
-    # Check if comments part already exists
+    # Return existing part if already set up
     try:
         for rel in part.rels.values():
             if rel.reltype == REL_TYPE:
-                return rel.target_part
+                cp = rel.target_part
+                if not hasattr(cp, "_comments_root"):
+                    cp._comments_root = parse_xml(cp.blob)
+                return cp
     except Exception:
         pass
 
-    # Create new comments part.
-    # IMPORTANT: use XmlPart, not Part — XmlPart.blob serialises from its
-    # cached _element, so modifications made via .element are persisted when
-    # the document is saved.  Plain Part.blob just returns the original bytes
-    # and ignores any element mutations.
+    # Build a minimal comments.xml and parse it
     comments_xml = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
         '</w:comments>'
     )
+    xml_bytes = comments_xml.encode("utf-8")
+    cp = Part(PackURI("/word/comments.xml"), CT_COMMENTS, xml_bytes, part.package)
+    cp._comments_root = parse_xml(xml_bytes)
+    part.relate_to(cp, REL_TYPE)
+    return cp
 
-    comments_part = XmlPart(
-        PackURI("/word/comments.xml"),
-        CT_COMMENTS,
-        comments_xml.encode("utf-8"),
-        part.package,
-    )
-    part.relate_to(comments_part, REL_TYPE)
-    return comments_part
+
+def _sync_comments_part(doc):
+    """Serialise the mutated comments element back into the part's blob.
+
+    Must be called once, right before doc.save(), so that all comment XML
+    written via add_comment() actually ends up in the output file.
+    """
+    from docx.oxml.ns import nsmap
+    from lxml import etree
+
+    REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
+    try:
+        for rel in doc.part.rels.values():
+            if rel.reltype == REL_TYPE:
+                cp = rel.target_part
+                if hasattr(cp, "_comments_root"):
+                    cp.blob = etree.tostring(
+                        cp._comments_root,
+                        xml_declaration=True,
+                        encoding="UTF-8",
+                        standalone=True,
+                    )
+                return
+    except Exception as e:
+        logger.warning("Kommentar-Synchronisierung fehlgeschlagen: %s", e)
 
 
 def call_claude(text, role):
@@ -449,6 +479,29 @@ def add_findings_appendix(out_doc, findings):
         tcPr.append(shd)
 
 
+def _collect_all_paragraphs(doc):
+    """Return (text, paragraph) tuples for ALL paragraphs in the document,
+    including those inside table cells.  Plain doc.paragraphs skips tables."""
+    from docx.oxml.ns import qn as _qn
+    from docx.text.paragraph import Paragraph
+
+    result = []
+    for block in doc.element.body:
+        tag = block.tag.split("}")[-1] if "}" in block.tag else block.tag
+        if tag == "p":
+            p_obj = Paragraph(block, doc)
+            txt = p_obj.text
+            if txt.strip():
+                result.append((txt, p_obj))
+        elif tag == "tbl":
+            for p_elem in block.iter(_qn("w:p")):
+                p_obj = Paragraph(p_elem, doc)
+                txt = p_obj.text
+                if txt.strip():
+                    result.append((txt, p_obj))
+    return result
+
+
 def process_document(text, role, output_dir, source_doc=None):
     """
     Main entry point: takes document text and role, returns path to output DOCX.
@@ -476,9 +529,8 @@ def process_document(text, role, output_dir, source_doc=None):
 
         # Collect paragraph references BEFORE inserting the summary header,
         # so we only match against real document content.
-        output_paragraphs = [
-            (p.text, p) for p in out_doc.paragraphs if p.text.strip()
-        ]
+        # Include table-cell paragraphs so quotes from tables can be matched.
+        output_paragraphs = _collect_all_paragraphs(out_doc)
 
         # Insert summary + divider before the first content element.
         _prepend_summary(out_doc, summary)
@@ -539,6 +591,9 @@ def process_document(text, role, output_dir, source_doc=None):
 
     if unmatched_findings:
         logger.warning("%d Findings konnten nicht zugeordnet werden", len(unmatched_findings))
+
+    # Serialise mutated comments element back into the part blob before saving
+    _sync_comments_part(out_doc)
 
     # Save output
     output_path = os.path.join(output_dir, f"review_{uuid.uuid4()}.docx")
