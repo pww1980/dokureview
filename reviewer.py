@@ -154,11 +154,18 @@ Format:
     {{
       "id": 1,
       "severity": "red" | "orange" | "green",
-      "quote": "Exakte Textstelle aus dem Dokument (so kurz wie möglich, max. 200 Zeichen)",
+      "quote": "WÖRTLICHES Zitat aus dem Dokument – exakt so wie es im Text steht, keine Paraphrasen, keine eigenen Formulierungen, kein [...]  (so kurz wie möglich, max. 150 Zeichen, immer zusammenhängender Text aus EINEM Absatz oder einer Tabellenzelle)",
       "comment": "Erläuterung des Befundes und Handlungsempfehlung"
     }}
   ]
 }}
+
+Wichtige Regeln für das Feld 'quote':
+- Nur wörtlicher Text der tatsächlich so im Dokument vorkommt
+- Kein [...]  keine Auslassungen, kein Kürzen mit Ellipsen
+- Keine eigenen Formulierungen oder Zusammenfassungen als Quote
+- Wenn kein passender Textteil vorhanden ist: verwende den nächstliegenden konkreten Satz
+- Für Tabellen: Text einer einzelnen Zelle oder Zeile verwenden
 
 Severity-Bedeutung:
 - red: Kritisches Problem, sofortiger Handlungsbedarf
@@ -216,15 +223,13 @@ def find_quote_in_paragraphs(paragraphs, quote):
     Fuzzy search for quote in paragraphs.
     Returns list of (para_index, start_char, end_char) tuples.
     """
-    # Normalize quote
-    norm_quote = re.sub(r"\s+", " ", quote.strip()).lower()
+    norm_quote = _norm(quote)
     if not norm_quote:
         return []
 
     results = []
     for i, para in enumerate(paragraphs):
-        text = para.text
-        norm_text = re.sub(r"\s+", " ", text.strip()).lower()
+        norm_text = _norm(para.text)
         idx = norm_text.find(norm_quote)
         if idx != -1:
             results.append((i, idx, idx + len(norm_quote)))
@@ -457,7 +462,21 @@ def add_findings_appendix(out_doc, findings):
 
 
 def _norm(s):
-    """Normalise whitespace and lower-case for fuzzy matching."""
+    """Normalise text for fuzzy matching.
+
+    Handles:
+    - Non-breaking and other exotic spaces (\u00a0, \u2009, etc.)
+    - Table-extraction separators (' | ') added during text extraction
+    - Claude's ellipsis notation ([...] / […]) produced when it truncates
+    - Standard whitespace collapsing + lower-case
+    """
+    # Exotic whitespace → regular space
+    s = re.sub(r"[\u00a0\u2009\u202f\u2002\u2003\u2060]", " ", s)
+    # Table-extraction separators (added in app.py when joining cells)
+    s = re.sub(r"\s*\|\s*", " ", s)
+    # Claude ellipsis markers
+    s = re.sub(r"\[\.\.\.?\]|\u2026", " ", s)
+    # Collapse whitespace, strip, lowercase
     return re.sub(r"\s+", " ", s.strip()).lower()
 
 
