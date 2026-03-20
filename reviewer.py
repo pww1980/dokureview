@@ -94,7 +94,7 @@ def add_comment(doc, paragraph, run, comment_text, author="Document Reviewer"):
 
 def _get_or_create_comments_part(doc):
     """Gets or creates the comments part of the document."""
-    from docx.opc.part import Part
+    from docx.opc.part import XmlPart
     from docx.opc.packuri import PackURI
 
     CT_COMMENTS = "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"
@@ -110,30 +110,19 @@ def _get_or_create_comments_part(doc):
     except Exception:
         pass
 
-    # Create new comments part
+    # Create new comments part.
+    # IMPORTANT: use XmlPart, not Part — XmlPart.blob serialises from its
+    # cached _element, so modifications made via .element are persisted when
+    # the document is saved.  Plain Part.blob just returns the original bytes
+    # and ignores any element mutations.
     comments_xml = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<w:comments xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas" '
-        'xmlns:mo="http://schemas.microsoft.com/office/mac/office/2008/main" '
-        'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" '
-        'xmlns:mv="urn:schemas-microsoft-com:mac:vml" '
-        'xmlns:o="urn:schemas-microsoft-com:office:office" '
-        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
-        'xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math" '
-        'xmlns:v="urn:schemas-microsoft-com:vml" '
-        'xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing" '
-        'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
-        'xmlns:w10="urn:schemas-microsoft-com:office:word" '
-        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
-        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" '
-        'xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup" '
-        'xmlns:wpi="http://schemas.microsoft.com/office/word/2010/wordprocessingInk" '
-        'xmlns:wne="http://schemas.microsoft.com/office/word/2006/wordml" '
-        'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" '
-        'mc:Ignorable="mv mo w14 wp14"></w:comments>'
+        '<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '</w:comments>'
     )
 
-    comments_part = Part(
+    comments_part = XmlPart(
         PackURI("/word/comments.xml"),
         CT_COMMENTS,
         comments_xml.encode("utf-8"),
@@ -393,10 +382,13 @@ def _prepend_summary(out_doc, summary):
     ]
 
     if first is not None:
-        # addprevious inserts immediately before `first`; iterate in reverse
-        # so the first element ends up at the top.
+        # Insert in reverse order, updating the reference each time so that
+        # each new element is placed before the previously inserted one.
+        # Result: elements appear in their original list order before `first`.
+        ref = first
         for elem in reversed(elements):
-            first.addprevious(elem)
+            ref.addprevious(elem)
+            ref = elem
     else:
         for elem in elements:
             body.append(elem)
