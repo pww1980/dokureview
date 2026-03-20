@@ -94,7 +94,7 @@ def add_comment(doc, paragraph, run, comment_text, author="Document Reviewer"):
 
 def _get_or_create_comments_part(doc):
     """Gets or creates the comments part of the document."""
-    from docx.opc.part import Part
+    from docx.opc.part import XmlPart
     from docx.opc.packuri import PackURI
 
     CT_COMMENTS = "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"
@@ -110,30 +110,19 @@ def _get_or_create_comments_part(doc):
     except Exception:
         pass
 
-    # Create new comments part
+    # Create new comments part.
+    # IMPORTANT: use XmlPart, not Part — XmlPart.blob serialises from its
+    # cached _element, so modifications made via .element are persisted when
+    # the document is saved.  Plain Part.blob just returns the original bytes
+    # and ignores any element mutations.
     comments_xml = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<w:comments xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas" '
-        'xmlns:mo="http://schemas.microsoft.com/office/mac/office/2008/main" '
-        'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" '
-        'xmlns:mv="urn:schemas-microsoft-com:mac:vml" '
-        'xmlns:o="urn:schemas-microsoft-com:office:office" '
-        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
-        'xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math" '
-        'xmlns:v="urn:schemas-microsoft-com:vml" '
-        'xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing" '
-        'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
-        'xmlns:w10="urn:schemas-microsoft-com:office:word" '
-        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
-        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" '
-        'xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup" '
-        'xmlns:wpi="http://schemas.microsoft.com/office/word/2010/wordprocessingInk" '
-        'xmlns:wne="http://schemas.microsoft.com/office/word/2006/wordml" '
-        'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" '
-        'mc:Ignorable="mv mo w14 wp14"></w:comments>'
+        '<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '</w:comments>'
     )
 
-    comments_part = Part(
+    comments_part = XmlPart(
         PackURI("/word/comments.xml"),
         CT_COMMENTS,
         comments_xml.encode("utf-8"),
@@ -349,36 +338,60 @@ def apply_finding_to_paragraph(doc, out_para, finding, quote):
     return True
 
 
-def copy_paragraph(out_doc, src_para):
-    """
-    Copies a paragraph with formatting into out_doc, safely.
-    Skips relationship-based elements (hyperlinks, drawings, objects) that would
-    produce invalid r:id references in the new document and corrupt it.
-    """
-    import copy as _copy
+def _prepend_summary(out_doc, summary):
+    """Insert review summary + divider before the first content in the document body."""
+    body = out_doc.element.body
+    # Find the first child element (w:p, w:tbl, w:sectPr, …)
+    first = body[0] if len(body) > 0 else None
 
-    out_para = out_doc.add_paragraph()
-    # Clear the default empty paragraph element that add_paragraph creates
-    for child in list(out_para._p):
-        out_para._p.remove(child)
+    def _make_p(text=None, style_id=None, bg_color=None, text_color=None):
+        p = OxmlElement("w:p")
+        pPr = OxmlElement("w:pPr")
+        if style_id:
+            ps = OxmlElement("w:pStyle")
+            ps.set(qn("w:val"), style_id)
+            pPr.append(ps)
+        if bg_color:
+            shd = OxmlElement("w:shd")
+            shd.set(qn("w:val"), "clear")
+            shd.set(qn("w:color"), "auto")
+            shd.set(qn("w:fill"), bg_color)
+            pPr.append(shd)
+        p.append(pPr)
+        if text:
+            r = OxmlElement("w:r")
+            if text_color:
+                rPr = OxmlElement("w:rPr")
+                col = OxmlElement("w:color")
+                col.set(qn("w:val"), text_color)
+                rPr.append(col)
+                r.append(rPr)
+            t = OxmlElement("w:t")
+            t.text = text
+            t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            r.append(t)
+            p.append(r)
+        return p
 
-    for child in src_para._p:
-        tag = child.tag
-        if tag == qn("w:pPr"):
-            # Paragraph properties: alignment, indentation, spacing, style, numbering.
-            # These contain no r:id relationship references — safe to deep-copy.
-            out_para._p.append(_copy.deepcopy(child))
-        elif tag == qn("w:r"):
-            # Regular run: rPr (bold/italic/font/size/color) has no r:id refs — safe.
-            out_para._p.append(_copy.deepcopy(child))
-        elif tag == qn("w:hyperlink"):
-            # Hyperlink carries an r:id ref we must NOT copy. Extract inner runs only.
-            for inner_run in child.findall(qn("w:r")):
-                out_para._p.append(_copy.deepcopy(inner_run))
-        # Skip: w:drawing, w:object, w:pict (images) and w:bookmarkStart/End,
-        # w:proofErr, w:ins, w:del — all either carry r:id refs or are irrelevant.
+    # Build elements in desired reading order
+    elements = [
+        _make_p("Review-Zusammenfassung", style_id="Heading1", text_color="1A3A5C"),
+        _make_p(summary, bg_color="F2F2F2"),
+        _make_p(),  # spacer
+        _make_p("Dokument", style_id="Heading2", text_color="1A3A5C"),
+    ]
 
-    return out_para
+    if first is not None:
+        # Insert in reverse order, updating the reference each time so that
+        # each new element is placed before the previously inserted one.
+        # Result: elements appear in their original list order before `first`.
+        ref = first
+        for elem in reversed(elements):
+            ref.addprevious(elem)
+            ref = elem
+    else:
+        for elem in elements:
+            body.append(elem)
 
 
 def add_summary_section(out_doc, summary):
@@ -449,27 +462,34 @@ def process_document(text, role, output_dir, source_doc=None):
     findings = analysis.get("findings", [])
     logger.info("Analyse erhalten: %d Findings", len(findings))
 
-    # Build output DOCX
-    out_doc = Document()
-
-    # Add summary at the top
-    add_summary_section(out_doc, summary)
-
-    # Divider
-    divider = out_doc.add_heading("Dokument", level=2)
-    divider.runs[0].font.color.rgb = RGBColor(0x1A, 0x3A, 0x5C)
-
     unmatched_findings = []
     output_paragraphs = []
 
     if source_doc is not None:
-        # Copy paragraphs with full formatting from the original DOCX
-        for src_para in source_doc.paragraphs:
-            out_para = copy_paragraph(out_doc, src_para)
-            if src_para.text.strip():
-                output_paragraphs.append((src_para.text, out_para))
+        # Clone the entire source document via BytesIO so all relationships,
+        # styles and numbering definitions remain valid in the output file.
+        from io import BytesIO
+        buf = BytesIO()
+        source_doc.save(buf)
+        buf.seek(0)
+        out_doc = Document(buf)
+
+        # Collect paragraph references BEFORE inserting the summary header,
+        # so we only match against real document content.
+        output_paragraphs = [
+            (p.text, p) for p in out_doc.paragraphs if p.text.strip()
+        ]
+
+        # Insert summary + divider before the first content element.
+        _prepend_summary(out_doc, summary)
     else:
-        # Plain text input: create simple paragraphs
+        # Plain text / TXT input: build a fresh document.
+        out_doc = Document()
+        add_summary_section(out_doc, summary)
+        divider = out_doc.add_heading("Dokument", level=2)
+        if divider.runs:
+            divider.runs[0].font.color.rgb = RGBColor(0x1A, 0x3A, 0x5C)
+
         for para_text in [p.strip() for p in text.split("\n") if p.strip()]:
             out_para = out_doc.add_paragraph(para_text)
             output_paragraphs.append((para_text, out_para))
