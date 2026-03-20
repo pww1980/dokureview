@@ -323,15 +323,18 @@ def apply_finding_to_paragraph(doc, out_para, finding, quote):
     color = SEVERITY_COLORS.get(finding.get("severity", "green"), "C6EFCE")
     comment_text = f"[{SEVERITY_LABELS.get(finding.get('severity','green'), '')}] {finding.get('comment', '')}"
 
-    # Normalize texts for matching
-    norm_quote = re.sub(r"\s+", " ", quote.strip()).lower()
-    norm_para = re.sub(r"\s+", " ", out_para.text.strip()).lower()
+    actual_text = out_para.text
 
-    start = norm_para.find(norm_quote)
-    if start == -1:
+    # Build regex that allows any whitespace between words (handles collapsed spaces)
+    words = re.sub(r"\s+", " ", quote.strip()).split()
+    if not words:
+        return False
+    pattern = r"\s+".join(re.escape(w) for w in words)
+    m = re.search(pattern, actual_text, re.IGNORECASE)
+    if not m:
         return False
 
-    end = start + len(norm_quote)
+    start, end = m.start(), m.end()
 
     target_run = split_run_at_positions(out_para, start, end)
     if target_run is None:
@@ -344,6 +347,18 @@ def apply_finding_to_paragraph(doc, out_para, finding, quote):
         logger.warning("Kommentar konnte nicht eingefügt werden: %s", e)
 
     return True
+
+
+def copy_paragraph(out_doc, src_para):
+    """Deep-copies a paragraph including all formatting/runs into out_doc."""
+    import copy as _copy
+    from docx.text.paragraph import Paragraph as DocxParagraph
+
+    src_copy = _copy.deepcopy(src_para._p)
+    # Add empty placeholder paragraph, then replace its element
+    placeholder = out_doc.add_paragraph()
+    placeholder._p.getparent().replace(placeholder._p, src_copy)
+    return DocxParagraph(src_copy, src_copy.getparent())
 
 
 def add_summary_section(out_doc, summary):
@@ -401,9 +416,10 @@ def add_findings_appendix(out_doc, findings):
         tcPr.append(shd)
 
 
-def process_document(text, role, output_dir):
+def process_document(text, role, output_dir, source_doc=None):
     """
     Main entry point: takes document text and role, returns path to output DOCX.
+    If source_doc (python-docx Document) is provided, paragraph formatting is preserved.
     """
     logger.info("Starte Dokumentenverarbeitung: %d Zeichen, Rolle='%s'", len(text), role.get("name"))
 
@@ -423,16 +439,20 @@ def process_document(text, role, output_dir):
     divider = out_doc.add_heading("Dokument", level=2)
     divider.runs[0].font.color.rgb = RGBColor(0x1A, 0x3A, 0x5C)
 
-    # Reproduce original text paragraph by paragraph
-    paragraphs_text = [p.strip() for p in text.split("\n") if p.strip()]
-
-    # Map findings by paragraph
     unmatched_findings = []
     output_paragraphs = []
 
-    for para_text in paragraphs_text:
-        out_para = out_doc.add_paragraph(para_text)
-        output_paragraphs.append((para_text, out_para))
+    if source_doc is not None:
+        # Copy paragraphs with full formatting from the original DOCX
+        for src_para in source_doc.paragraphs:
+            out_para = copy_paragraph(out_doc, src_para)
+            if src_para.text.strip():
+                output_paragraphs.append((src_para.text, out_para))
+    else:
+        # Plain text input: create simple paragraphs
+        for para_text in [p.strip() for p in text.split("\n") if p.strip()]:
+            out_para = out_doc.add_paragraph(para_text)
+            output_paragraphs.append((para_text, out_para))
 
     # Apply findings
     for finding in findings:
@@ -441,13 +461,10 @@ def process_document(text, role, output_dir):
             continue
 
         matched = False
-        for para_text, out_para in output_paragraphs:
-            norm_quote = re.sub(r"\s+", " ", quote).lower()
-            norm_para = re.sub(r"\s+", " ", para_text).lower()
-            if norm_quote in norm_para:
-                if apply_finding_to_paragraph(out_doc, out_para, finding, quote):
-                    matched = True
-                    break
+        for _para_text, out_para in output_paragraphs:
+            if apply_finding_to_paragraph(out_doc, out_para, finding, quote):
+                matched = True
+                break
 
         if not matched:
             logger.warning("Quote nicht im Dokument gefunden (Finding #%s): '%s...'",

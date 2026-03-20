@@ -106,10 +106,11 @@ def review():
         try:
             if ext == ".docx":
                 from docx import Document
-                doc = Document(tmp_path)
-                text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+                source_doc = Document(tmp_path)
+                text = "\n".join(p.text for p in source_doc.paragraphs if p.text.strip())
                 filename = original_filename
             else:
+                source_doc = None
                 with open(tmp_path, "r", encoding="utf-8", errors="replace") as f:
                     text = f.read()
                 filename = original_filename
@@ -118,6 +119,7 @@ def review():
 
     elif request.form.get("text"):
         text = request.form.get("text").strip()
+        source_doc = None
         filename = "eingabe.txt"
         logger.info("Texteingabe empfangen (%d Zeichen), Rolle: %s", len(text), role_id)
     else:
@@ -135,7 +137,7 @@ def review():
 
     logger.info("Starte Review: Rolle='%s', Datei='%s', Textlänge=%d", role["name"], filename, len(text))
     try:
-        output_path = process_document(text, role, UPLOAD_FOLDER)
+        output_path = process_document(text, role, UPLOAD_FOLDER, source_doc=source_doc)
     except Exception as e:
         logger.exception("Verarbeitungsfehler für Datei '%s', Rolle '%s': %s", filename, role_id, e)
         return jsonify({"error": f"Verarbeitungsfehler: {str(e)}"}), 500
