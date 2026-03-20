@@ -27,7 +27,7 @@ SEVERITY_LABELS = {
 }
 
 MODEL = "claude-sonnet-4-5"
-MAX_TOKENS = 8096
+MAX_TOKENS = 8192  # actual maximum for claude-sonnet-4-5
 
 
 def highlight_run(run, hex_color):
@@ -139,6 +139,42 @@ def _get_or_create_comments_part(doc):
     return cp
 
 
+def _repair_json(s):
+    """Best-effort repair of common JSON errors produced by LLMs.
+
+    The most frequent mistake is a missing comma between two consecutive
+    key-value pairs inside an object.  Example:
+
+        "severity": "orange"
+        "quote": "..."          ← comma missing after previous value
+
+    Strategy: scan line by line; if a line ends with a JSON value
+    (closing quote, digit, true/false/null, }, ]) and the next non-empty
+    line starts with a quote character (a new key), insert a comma.
+    """
+    lines = s.split("\n")
+    out = []
+    # Regex: line that ends with a JSON value (no trailing comma yet)
+    ends_value = re.compile(r'(^|.*[^,])\s*(["\d}\]]|true|false|null)\s*$')
+    for i, line in enumerate(lines):
+        out.append(line)
+        stripped = line.rstrip()
+        if not ends_value.match(stripped):
+            continue
+        if stripped.endswith(","):
+            continue
+        # Find the next non-empty line
+        for j in range(i + 1, len(lines)):
+            next_stripped = lines[j].strip()
+            if not next_stripped:
+                continue
+            if next_stripped.startswith('"'):
+                # Next line is a new key → insert comma
+                out[-1] = stripped + ","
+            break
+    return "\n".join(out)
+
+
 def call_claude(text, role):
     """Calls Claude API and returns parsed JSON findings."""
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
@@ -209,7 +245,26 @@ Dokument:
             if "summary" in result and "findings" in result:
                 logger.info("Claude-Antwort erfolgreich geparst: %d Findings", len(result["findings"]))
                 return result
-        except (json.JSONDecodeError, KeyError) as e:
+        except json.JSONDecodeError as e:
+            logger.warning("JSON-Parse-Fehler (Versuch %d): %s", attempt + 1, e)
+            # Attempt repair before giving up or retrying.
+            # LLMs occasionally omit commas between key-value pairs.
+            repaired = _repair_json(raw)
+            if repaired != raw:
+                try:
+                    result = json.loads(repaired)
+                    if "summary" in result and "findings" in result:
+                        logger.info(
+                            "JSON nach Reparatur erfolgreich geparst: %d Findings",
+                            len(result["findings"]),
+                        )
+                        return result
+                except json.JSONDecodeError:
+                    pass
+            if attempt == 1:
+                raise ValueError(f"Claude hat kein valides JSON zurückgegeben: {raw[:200]}")
+            continue
+        except KeyError as e:
             logger.warning("JSON-Parse-Fehler (Versuch %d): %s", attempt + 1, e)
             if attempt == 1:
                 raise ValueError(f"Claude hat kein valides JSON zurückgegeben: {raw[:200]}")
