@@ -107,7 +107,28 @@ def review():
             if ext == ".docx":
                 from docx import Document
                 source_doc = Document(tmp_path)
-                text = "\n".join(p.text for p in source_doc.paragraphs if p.text.strip())
+                # Extract text from paragraphs AND table cells so that
+                # tables (e.g. RACI matrices) are included in the review.
+                lines = []
+                from docx.oxml.ns import qn as _qn
+                for block in source_doc.element.body:
+                    tag = block.tag.split("}")[-1] if "}" in block.tag else block.tag
+                    if tag == "p":
+                        t = "".join(n.text or "" for n in block.iter() if n.tag.endswith("}t"))
+                        if t.strip():
+                            lines.append(t)
+                    elif tag == "tbl":
+                        for row in block.findall(".//" + _qn("w:tr")):
+                            cells = []
+                            for cell in row.findall(".//" + _qn("w:tc")):
+                                cell_text = "".join(
+                                    n.text or "" for n in cell.iter() if n.tag.endswith("}t")
+                                ).strip()
+                                if cell_text:
+                                    cells.append(cell_text)
+                            if cells:
+                                lines.append(" | ".join(cells))
+                text = "\n".join(lines)
                 filename = original_filename
             else:
                 source_doc = None
