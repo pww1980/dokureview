@@ -27,7 +27,7 @@ SEVERITY_LABELS = {
 }
 
 MODEL = "claude-sonnet-4-5"
-MAX_TOKENS = 4096
+MAX_TOKENS = 8096
 
 
 def highlight_run(run, hex_color):
@@ -190,10 +190,16 @@ Dokument:
         raw = response.content[0].text.strip()
         logger.debug("Claude-Antwort (%d Zeichen): %s...", len(raw), raw[:100])
 
-        # Extract JSON from response (handle markdown code blocks)
+        # Extract JSON: try fenced code block first, then bare JSON object
         json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw)
         if json_match:
             raw = json_match.group(1)
+        else:
+            # Handle truncated responses where closing ``` is missing
+            bare_match = re.search(r"(\{[\s\S]*\})", raw)
+            if bare_match:
+                raw = bare_match.group(1)
+                logger.warning("Kein geschlossener Code-Block gefunden, verwende rohen JSON-Block")
 
         try:
             result = json.loads(raw)
