@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.py[cod]
+*.pyo
+uploads/*
+!uploads/.gitkeep
+*.docx
+.DS_Store

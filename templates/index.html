@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dokument Review</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <h1>Dokument Review</h1>
+      <nav>
+        <a href="/" class="nav-link active">Review</a>
+        <a href="/config" class="nav-link">Rollen konfigurieren</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <div class="card">
+      <h2>Dokument analysieren</h2>
+
+      <form id="reviewForm" enctype="multipart/form-data">
+        <div class="form-group">
+          <label for="roleSelect">Rolle auswählen</label>
+          <select id="roleSelect" name="role_id" required>
+            <option value="">-- Rolle auswählen --</option>
+          </select>
+        </div>
+
+        <div class="tab-bar">
+          <button type="button" class="tab-btn active" data-tab="file">Datei hochladen</button>
+          <button type="button" class="tab-btn" data-tab="text">Text eingeben</button>
+        </div>
+
+        <div id="tab-file" class="tab-content active">
+          <div class="form-group">
+            <label for="fileInput">DOCX oder TXT Datei (max. 10 MB)</label>
+            <div class="file-drop" id="fileDrop">
+              <input type="file" id="fileInput" name="file" accept=".docx,.txt">
+              <div class="file-drop-label">
+                <span class="file-icon">📄</span>
+                <span id="fileLabel">Datei hierher ziehen oder klicken zum Auswählen</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="tab-text" class="tab-content">
+          <div class="form-group">
+            <label for="textInput">Dokumenttext</label>
+            <textarea id="textInput" name="text" rows="12" placeholder="Fügen Sie hier den zu prüfenden Text ein..."></textarea>
+          </div>
+        </div>
+
+        <div class="form-actions">
+          <button type="submit" id="submitBtn" class="btn btn-primary">Review starten</button>
+        </div>
+      </form>
+
+      <div id="statusArea" class="status-area hidden">
+        <div class="spinner"></div>
+        <p id="statusText">Dokument wird analysiert…</p>
+      </div>
+
+      <div id="resultArea" class="result-area hidden">
+        <div class="result-success">
+          <span class="result-icon">✅</span>
+          <div>
+            <strong>Review abgeschlossen</strong>
+            <p>Das kommentierte Dokument steht zum Download bereit.</p>
+          </div>
+        </div>
+        <a id="downloadLink" href="#" class="btn btn-primary" download>DOCX herunterladen</a>
+
+        <div class="legend">
+          <h4>Farbcodierung</h4>
+          <ul>
+            <li><span class="legend-dot red"></span> Rot = Kritisch</li>
+            <li><span class="legend-dot orange"></span> Orange = Überarbeitungsbedarf</li>
+            <li><span class="legend-dot green"></span> Grün = In Ordnung</li>
+          </ul>
+        </div>
+      </div>
+
+      <div id="errorArea" class="error-area hidden">
+        <span class="error-icon">❌</span>
+        <p id="errorText"></p>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    // Load roles into dropdown
+    async function loadRoles() {
+      try {
+        const res = await fetch('/roles');
+        const roles = await res.json();
+        const select = document.getElementById('roleSelect');
+        roles.forEach(role => {
+          const opt = document.createElement('option');
+          opt.value = role.id;
+          opt.textContent = role.name;
+          select.appendChild(opt);
+        });
+      } catch (e) {
+        console.error('Fehler beim Laden der Rollen:', e);
+      }
+    }
+
+    // Tab switching
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+      });
+    });
+
+    // File input label update
+    const fileInput = document.getElementById('fileInput');
+    const fileLabel = document.getElementById('fileLabel');
+    fileInput.addEventListener('change', () => {
+      fileLabel.textContent = fileInput.files[0]?.name || 'Datei hierher ziehen oder klicken zum Auswählen';
+    });
+
+    // Drag & drop
+    const fileDrop = document.getElementById('fileDrop');
+    fileDrop.addEventListener('dragover', e => { e.preventDefault(); fileDrop.classList.add('drag-over'); });
+    fileDrop.addEventListener('dragleave', () => fileDrop.classList.remove('drag-over'));
+    fileDrop.addEventListener('drop', e => {
+      e.preventDefault();
+      fileDrop.classList.remove('drag-over');
+      if (e.dataTransfer.files[0]) {
+        fileInput.files = e.dataTransfer.files;
+        fileLabel.textContent = e.dataTransfer.files[0].name;
+      }
+    });
+    fileDrop.addEventListener('click', () => fileInput.click());
+
+    // Form submission
+    document.getElementById('reviewForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+
+      const statusArea = document.getElementById('statusArea');
+      const resultArea = document.getElementById('resultArea');
+      const errorArea = document.getElementById('errorArea');
+      const submitBtn = document.getElementById('submitBtn');
+
+      statusArea.classList.remove('hidden');
+      resultArea.classList.add('hidden');
+      errorArea.classList.add('hidden');
+      submitBtn.disabled = true;
+
+      const formData = new FormData(e.target);
+
+      // Determine active tab
+      const activeTab = document.querySelector('.tab-btn.active').dataset.tab;
+      if (activeTab === 'text') {
+        formData.delete('file');
+      } else {
+        formData.delete('text');
+      }
+
+      try {
+        const res = await fetch('/review', {
+          method: 'POST',
+          body: formData,
+        });
+
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ error: 'Unbekannter Fehler' }));
+          throw new Error(err.error || `HTTP ${res.status}`);
+        }
+
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const disposition = res.headers.get('Content-Disposition') || '';
+        const nameMatch = disposition.match(/filename="?([^";\n]+)"?/);
+        const filename = nameMatch ? nameMatch[1] : 'review.docx';
+
+        const downloadLink = document.getElementById('downloadLink');
+        downloadLink.href = url;
+        downloadLink.download = filename;
+
+        statusArea.classList.add('hidden');
+        resultArea.classList.remove('hidden');
+      } catch (err) {
+        statusArea.classList.add('hidden');
+        errorArea.classList.remove('hidden');
+        document.getElementById('errorText').textContent = err.message;
+      } finally {
+        submitBtn.disabled = false;
+      }
+    });
+
+    loadRoles();
+  </script>
+</body>
+</html>

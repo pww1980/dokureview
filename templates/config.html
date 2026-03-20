@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rollen konfigurieren – Dokument Review</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <h1>Dokument Review</h1>
+      <nav>
+        <a href="/" class="nav-link">Review</a>
+        <a href="/config" class="nav-link active">Rollen konfigurieren</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <div class="card">
+      <div class="card-header">
+        <h2>Rollen verwalten</h2>
+        <button class="btn btn-secondary" id="addRoleBtn">+ Rolle hinzufügen</button>
+      </div>
+
+      <div id="rolesList"></div>
+
+      <div class="form-actions">
+        <button class="btn btn-primary" id="saveBtn">Alle Rollen speichern</button>
+      </div>
+
+      <div id="saveStatus" class="save-status hidden"></div>
+    </div>
+  </main>
+
+  <template id="roleTemplate">
+    <div class="role-card" data-role-id="">
+      <div class="role-card-header">
+        <div class="form-group inline">
+          <label>Anzeigename</label>
+          <input type="text" class="role-name" placeholder="z.B. IT-Vertragsanwalt" required>
+        </div>
+        <div class="form-group inline">
+          <label>Sprache</label>
+          <select class="role-language">
+            <option value="de">Deutsch</option>
+            <option value="en">Englisch</option>
+          </select>
+        </div>
+        <button class="btn btn-danger btn-sm delete-btn" title="Rolle löschen">🗑 Löschen</button>
+      </div>
+      <div class="form-group">
+        <label>System Prompt</label>
+        <textarea class="role-prompt" rows="6" placeholder="Beschreibung der Rolle und Prüfungsaufgaben..."></textarea>
+      </div>
+    </div>
+  </template>
+
+  <script>
+    let roles = [];
+
+    async function loadRoles() {
+      const res = await fetch('/roles');
+      roles = await res.json();
+      renderRoles();
+    }
+
+    function renderRoles() {
+      const list = document.getElementById('rolesList');
+      list.innerHTML = '';
+      roles.forEach((role, idx) => {
+        const card = createRoleCard(role, idx);
+        list.appendChild(card);
+      });
+    }
+
+    function createRoleCard(role, idx) {
+      const template = document.getElementById('roleTemplate');
+      const card = template.content.cloneNode(true).querySelector('.role-card');
+      card.dataset.roleId = role.id || '';
+      card.dataset.idx = idx;
+
+      card.querySelector('.role-name').value = role.name || '';
+      card.querySelector('.role-language').value = role.language || 'de';
+      card.querySelector('.role-prompt').value = role.system_prompt || '';
+
+      card.querySelector('.delete-btn').addEventListener('click', async () => {
+        if (!confirm(`Rolle "${role.name}" wirklich löschen?`)) return;
+
+        if (role.id) {
+          try {
+            const res = await fetch('/config/delete', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ id: role.id }),
+            });
+            if (!res.ok) throw new Error('Löschen fehlgeschlagen');
+          } catch (e) {
+            alert('Fehler: ' + e.message);
+            return;
+          }
+        }
+
+        roles.splice(idx, 1);
+        renderRoles();
+      });
+
+      return card;
+    }
+
+    function generateId(name) {
+      return name.toLowerCase()
+        .replace(/[äöü]/g, c => ({ ä: 'ae', ö: 'oe', ü: 'ue' }[c] || c))
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-|-$/g, '')
+        || ('role-' + Date.now());
+    }
+
+    document.getElementById('addRoleBtn').addEventListener('click', () => {
+      const newRole = { id: '', name: '', language: 'de', system_prompt: '' };
+      roles.push(newRole);
+      renderRoles();
+      // Scroll to new card
+      const cards = document.querySelectorAll('.role-card');
+      cards[cards.length - 1]?.scrollIntoView({ behavior: 'smooth' });
+    });
+
+    document.getElementById('saveBtn').addEventListener('click', async () => {
+      const saveStatus = document.getElementById('saveStatus');
+      const cards = document.querySelectorAll('.role-card');
+      const updated = [];
+
+      for (const card of cards) {
+        const name = card.querySelector('.role-name').value.trim();
+        const language = card.querySelector('.role-language').value;
+        const prompt = card.querySelector('.role-prompt').value.trim();
+        const existingId = card.dataset.roleId;
+
+        if (!name) {
+          alert('Alle Rollen müssen einen Namen haben.');
+          return;
+        }
+
+        updated.push({
+          id: existingId || generateId(name),
+          name,
+          language,
+          system_prompt: prompt,
+        });
+      }
+
+      try {
+        const res = await fetch('/config/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(updated),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error || 'Speichern fehlgeschlagen');
+        }
+        roles = updated;
+        renderRoles();
+
+        saveStatus.textContent = '✅ Rollen erfolgreich gespeichert';
+        saveStatus.className = 'save-status success';
+        saveStatus.classList.remove('hidden');
+        setTimeout(() => saveStatus.classList.add('hidden'), 3000);
+      } catch (e) {
+        saveStatus.textContent = '❌ Fehler: ' + e.message;
+        saveStatus.className = 'save-status error';
+        saveStatus.classList.remove('hidden');
+      }
+    });
+
+    loadRoles();
+  </script>
+</body>
+</html>

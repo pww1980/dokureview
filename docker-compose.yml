@@ -1,0 +1,12 @@
+services:
+  doc-review:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - FLASK_SECRET_KEY=${FLASK_SECRET_KEY}
+    volumes:
+      - ./roles.json:/app/roles.json
+      - ./uploads:/app/uploads
