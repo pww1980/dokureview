@@ -2,10 +2,32 @@ import os
 import json
 import uuid
 import datetime
+import logging
+import logging.handlers
 from flask import Flask, request, jsonify, render_template, send_file, abort
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# --- Logging setup ---
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        logging.handlers.RotatingFileHandler(
+            os.path.join(LOG_DIR, "app.log"),
+            maxBytes=5 * 1024 * 1024,  # 5 MB
+            backupCount=5,
+            encoding="utf-8",
+        ),
+    ],
+)
+logger = logging.getLogger("dokureview.app")
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", os.urandom(24).hex())
@@ -45,11 +67,13 @@ def review():
 
     role_id = request.form.get("role_id")
     if not role_id:
+        logger.warning("Review-Anfrage ohne role_id abgelehnt")
         return jsonify({"error": "role_id ist erforderlich"}), 400
 
     roles = load_roles()
     role = next((r for r in roles if r["id"] == role_id), None)
     if not role:
+        logger.warning("Unbekannte Rolle angefragt: %s", role_id)
         return jsonify({"error": f"Rolle '{role_id}' nicht gefunden"}), 400
 
     text = None
@@ -58,20 +82,26 @@ def review():
     if "file" in request.files and request.files["file"].filename:
         file = request.files["file"]
         if file.content_length and file.content_length > MAX_FILE_SIZE:
+            logger.warning("Datei abgelehnt (zu groß): %s", file.filename)
             return jsonify({"error": "Datei zu groß (max. 10MB)"}), 413
 
         original_filename = file.filename
         ext = os.path.splitext(original_filename)[1].lower()
         if ext not in [".docx", ".txt"]:
+            logger.warning("Nicht unterstütztes Dateiformat: %s", ext)
             return jsonify({"error": "Nur DOCX und TXT Dateien werden unterstützt"}), 400
 
         tmp_path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4()}{ext}")
         file.save(tmp_path)
 
         # Check file size after save
-        if os.path.getsize(tmp_path) > MAX_FILE_SIZE:
+        actual_size = os.path.getsize(tmp_path)
+        if actual_size > MAX_FILE_SIZE:
             os.remove(tmp_path)
+            logger.warning("Datei nach dem Speichern zu groß: %s (%d Bytes)", original_filename, actual_size)
             return jsonify({"error": "Datei zu groß (max. 10MB)"}), 413
+
+        logger.info("Datei empfangen: %s (%d Bytes), Rolle: %s", original_filename, actual_size, role_id)
 
         try:
             if ext == ".docx":
@@ -89,24 +119,31 @@ def review():
     elif request.form.get("text"):
         text = request.form.get("text").strip()
         filename = "eingabe.txt"
+        logger.info("Texteingabe empfangen (%d Zeichen), Rolle: %s", len(text), role_id)
     else:
+        logger.warning("Review-Anfrage ohne Inhalt (keine Datei, kein Text)")
         return jsonify({"error": "Entweder eine Datei oder Text muss angegeben werden"}), 400
 
     if not text:
+        logger.warning("Dokument enthält keinen Text: %s", filename)
         return jsonify({"error": "Das Dokument enthält keinen Text"}), 400
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
+        logger.error("ANTHROPIC_API_KEY ist nicht gesetzt")
         return jsonify({"error": "ANTHROPIC_API_KEY ist nicht gesetzt"}), 500
 
+    logger.info("Starte Review: Rolle='%s', Datei='%s', Textlänge=%d", role["name"], filename, len(text))
     try:
         output_path = process_document(text, role, UPLOAD_FOLDER)
     except Exception as e:
+        logger.exception("Verarbeitungsfehler für Datei '%s', Rolle '%s': %s", filename, role_id, e)
         return jsonify({"error": f"Verarbeitungsfehler: {str(e)}"}), 500
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_role_name = role["name"].replace(" ", "_").replace("/", "_")
     download_name = f"review_{safe_role_name}_{timestamp}.docx"
+    logger.info("Review abgeschlossen: Download='%s'", download_name)
 
     response = send_file(
         output_path,
@@ -119,8 +156,9 @@ def review():
     def cleanup():
         try:
             os.remove(output_path)
-        except Exception:
-            pass
+            logger.debug("Temporäre Output-Datei gelöscht: %s", output_path)
+        except Exception as e:
+            logger.warning("Fehler beim Löschen der temporären Datei %s: %s", output_path, e)
 
     return response
 
@@ -141,6 +179,7 @@ def config_save():
             return jsonify({"error": "Jede Rolle benötigt id und name"}), 400
 
     save_roles(data)
+    logger.info("Rollen gespeichert (%d Einträge)", len(data))
     return jsonify({"success": True})
 
 
@@ -154,11 +193,14 @@ def config_delete():
     roles = load_roles()
     roles = [r for r in roles if r["id"] != role_id]
     save_roles(roles)
+    logger.info("Rolle gelöscht: %s", role_id)
     return jsonify({"success": True})
 
 
 if __name__ == "__main__":
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        print("WARNUNG: ANTHROPIC_API_KEY ist nicht gesetzt!")
+        logger.warning("ANTHROPIC_API_KEY ist nicht gesetzt — Reviews werden fehlschlagen!")
+    else:
+        logger.info("ANTHROPIC_API_KEY gefunden, App startet auf http://0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5000, debug=False)

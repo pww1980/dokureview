@@ -3,7 +3,10 @@ import json
 import uuid
 import re
 import datetime
+import logging
 import anthropic
+
+logger = logging.getLogger("dokureview.reviewer")
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.oxml.ns import qn
@@ -171,7 +174,12 @@ Dokument:
 {text}
 ---"""
 
+    logger.info("Claude-Aufruf: Modell=%s, Rolle='%s', Textlänge=%d Zeichen", MODEL, role.get("name"), len(text))
+
     for attempt in range(2):
+        if attempt > 0:
+            logger.warning("Claude-Retry (Versuch %d/2)", attempt + 1)
+
         response = client.messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
@@ -180,6 +188,7 @@ Dokument:
         )
 
         raw = response.content[0].text.strip()
+        logger.debug("Claude-Antwort (%d Zeichen): %s...", len(raw), raw[:100])
 
         # Extract JSON from response (handle markdown code blocks)
         json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw)
@@ -189,8 +198,10 @@ Dokument:
         try:
             result = json.loads(raw)
             if "summary" in result and "findings" in result:
+                logger.info("Claude-Antwort erfolgreich geparst: %d Findings", len(result["findings"]))
                 return result
-        except (json.JSONDecodeError, KeyError):
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning("JSON-Parse-Fehler (Versuch %d): %s", attempt + 1, e)
             if attempt == 1:
                 raise ValueError(f"Claude hat kein valides JSON zurückgegeben: {raw[:200]}")
             continue
@@ -323,8 +334,8 @@ def apply_finding_to_paragraph(doc, out_para, finding, quote):
     highlight_run(target_run, color)
     try:
         add_comment(doc, out_para, target_run, comment_text)
-    except Exception:
-        pass  # Comment insertion is best-effort
+    except Exception as e:
+        logger.warning("Kommentar konnte nicht eingefügt werden: %s", e)
 
     return True
 
@@ -388,10 +399,13 @@ def process_document(text, role, output_dir):
     """
     Main entry point: takes document text and role, returns path to output DOCX.
     """
+    logger.info("Starte Dokumentenverarbeitung: %d Zeichen, Rolle='%s'", len(text), role.get("name"))
+
     # Call Claude
     analysis = call_claude(text, role)
     summary = analysis.get("summary", "")
     findings = analysis.get("findings", [])
+    logger.info("Analyse erhalten: %d Findings", len(findings))
 
     # Build output DOCX
     out_doc = Document()
@@ -430,6 +444,8 @@ def process_document(text, role, output_dir):
                     break
 
         if not matched:
+            logger.warning("Quote nicht im Dokument gefunden (Finding #%s): '%s...'",
+                           finding.get("id", "?"), quote[:60])
             unmatched_findings.append(finding)
 
     # Append unmatched findings as footnotes at the end
@@ -458,7 +474,11 @@ def process_document(text, role, output_dir):
     # Append findings appendix table
     add_findings_appendix(out_doc, findings)
 
+    if unmatched_findings:
+        logger.warning("%d Findings konnten nicht zugeordnet werden", len(unmatched_findings))
+
     # Save output
     output_path = os.path.join(output_dir, f"review_{uuid.uuid4()}.docx")
     out_doc.save(output_path)
+    logger.info("Output-DOCX gespeichert: %s", output_path)
     return output_path
